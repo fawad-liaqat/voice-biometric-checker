@@ -1,0 +1,1031 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Voice Biometric Feasibility Checker</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              proceed: { bg: "#ECFDF5", border: "#6EE7B7", text: "#065F46" },
+              modify: { bg: "#FFFBEB", border: "#FCD34D", text: "#92400E" },
+              nofeasible: { bg: "#FEF2F2", border: "#FCA5A5", text: "#991B1B" },
+              block: { bg: "#FEF2F2", border: "#F87171", text: "#7F1D1D" },
+            },
+          },
+        },
+      };
+    </script>
+    <style>
+      body {
+        font-family:
+          "Inter",
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        background: #f8fafc;
+      }
+      .score-ring {
+        transition: stroke-dashoffset 0.5s ease;
+      }
+      .fade-in {
+        animation: fadeIn 0.3s ease-in;
+      }
+      @keyframes fadeIn {
+        from {
+          opacity: 0;
+          transform: translateY(8px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+      select {
+        appearance: none;
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%236B7280' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+        background-repeat: no-repeat;
+        background-position: right 12px center;
+      }
+      .drawer-content {
+        max-height: 0;
+        overflow: hidden;
+        transition: max-height 0.4s ease;
+      }
+      .drawer-content.open {
+        max-height: 4000px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="text/babel">
+      const { useState, useMemo, useCallback } = React;
+
+      // ═══════════════════════════════════════════════════
+      // SCORING ENGINE (mirrors standalone scoring.js)
+      // ═══════════════════════════════════════════════════
+
+      const BANDWIDTH_SCORES = {
+        "2G_ENROLLMENT": null,
+        "2G_AUTH": 25,
+        "3G": 65,
+        "4G": 90,
+        WIFI: 100,
+      };
+      const DEVICE_SCORES = {
+        FEATURE_PHONE: 20,
+        LOW_END_SMARTPHONE: 50,
+        MID_RANGE_SMARTPHONE: 80,
+        MODERN_SMARTPHONE: 95,
+      };
+      const NOISE_SCORES = {
+        CALL_CENTER: 90,
+        INDOOR_HOME: 70,
+        RURAL_OUTDOOR: 55,
+        URBAN_OUTDOOR: 35,
+      };
+      const DIALECT_SCORES = {
+        URDU_STANDARD: 90,
+        PUNJABI: 65,
+        SINDHI: 60,
+        PASHTO: 55,
+        BALOCHI: 50,
+        OTHER: 30,
+      };
+      const WEIGHTS = {
+        bandwidth: 0.25,
+        device: 0.15,
+        noise: 0.2,
+        regulatory: 0.2,
+        dialect: 0.2,
+      };
+
+      const RECOMMENDATIONS = {
+        bandwidth: {
+          threshold: 50,
+          text: "Use G.729 narrowband codec (8 kbps). Consider partner-embedded enrollment via a controlled network link rather than live user enrollment. Call center audio capture is the most reliable fallback for constrained connectivity environments.",
+        },
+        device: {
+          threshold: 50,
+          text: "Shift voice feature extraction entirely to the server side. Do not rely on on-device processing for feature phones or low-end hardware. Ensure a minimum 100ms audio buffer before transmission to reduce the impact of packet loss.",
+        },
+        noise: {
+          threshold: 60,
+          text: "Move enrollment to a controlled acoustic environment. Call center or quiet indoor enrollment is required. Outdoor enrollment degrades template quality irreversibly \u2014 noise captured at enrollment cannot be corrected post-hoc.",
+        },
+        regulatory_auth: {
+          threshold: 60,
+          text: "Voice can serve as a second authentication factor. Confirm that NADRA Verisys biometric verification was completed as primary at account opening per BPRD Circular 1/2025 before enabling voice authentication for this account.",
+        },
+        regulatory_enrollment: {
+          threshold: 60,
+          text: "Voice enrollment as standalone primary verification is non-compliant under BPRD Circular 1/2025. Restrict to secondary authentication layer, or pursue partner-embedded pre-enrollment through a compliant institutional channel such as a BISP call center or telco KYC recording.",
+        },
+        dialect: {
+          threshold: 60,
+          text: "Significant acoustic mismatch between speaker dialect and model training data. Recommend dialect-adapted fine-tuning or transfer learning using Meta\u2019s MMS multilingual model. Do not deploy to Pashto, Balochi, or regional dialect speakers with a standard Urdu-trained model without first conducting dialect-specific accuracy testing.",
+        },
+      };
+
+      // --- CORRELATION PROFILES ---
+      const CORRELATION_PROFILES = {
+        RURAL_PERIPHERAL: {
+          label: "Rural Peripheral",
+          description:
+            "Rural areas with 2G/3G connectivity, minority dialect speakers, outdoor environments, and feature phones. These conditions co-occur systematically in Balochistan, rural Sindh, FATA, and analogous regions across emerging markets.",
+          markers: {
+            bandwidth: ["2G_AUTH", "2G_ENROLLMENT", "3G"],
+            device: ["FEATURE_PHONE", "LOW_END_SMARTPHONE"],
+            noise: ["RURAL_OUTDOOR", "URBAN_OUTDOOR"],
+            dialect: ["BALOCHI", "PASHTO", "SINDHI", "OTHER"],
+          },
+        },
+        URBAN_OPTIMAL: {
+          label: "Urban Optimal",
+          description:
+            "Urban centers with 4G/WiFi, national language speakers, indoor or call center environments, and modern devices.",
+          markers: {
+            bandwidth: ["4G", "WIFI"],
+            device: ["MID_RANGE_SMARTPHONE", "MODERN_SMARTPHONE"],
+            noise: ["CALL_CENTER", "INDOOR_HOME"],
+            dialect: ["URDU_STANDARD"],
+          },
+        },
+        PERI_URBAN_MIXED: {
+          label: "Peri-urban Mixed",
+          description:
+            "Transitional zones with 3G, low-end smartphones, variable noise, and regional dialect overlap. Typical in smaller cities where infrastructure is unevenly distributed.",
+          markers: {
+            bandwidth: ["3G"],
+            device: ["LOW_END_SMARTPHONE"],
+            noise: ["INDOOR_HOME", "URBAN_OUTDOOR"],
+            dialect: ["PUNJABI", "SINDHI"],
+          },
+        },
+      };
+
+      function detectCorrelationProfile(inputs) {
+        const bw = inputs.bandwidth;
+        for (const [key, profile] of Object.entries(CORRELATION_PROFILES)) {
+          let m = 0;
+          if (profile.markers.bandwidth.includes(bw)) m++;
+          if (profile.markers.device.includes(inputs.device)) m++;
+          if (profile.markers.noise.includes(inputs.noise)) m++;
+          if (profile.markers.dialect.includes(inputs.dialect)) m++;
+          if (m >= 3)
+            return {
+              key,
+              label: profile.label,
+              description: profile.description,
+              matchStrength: m + "/4",
+            };
+        }
+        return null;
+      }
+
+      function computeRegulatoryScore(flags) {
+        if (flags.standaloneEnrollment) return { block: true, score: 0 };
+        let score = 50;
+        if (flags.nadraVerified) score += 20;
+        if (flags.authOnly) score += 15;
+        if (flags.tier1) score += 15;
+        return { block: false, score: Math.min(score, 100) };
+      }
+
+      function computeFeasibility(inputs) {
+        const result = {
+          regulatoryBlock: false,
+          enrollmentOverride: false,
+          composite: null,
+          category: null,
+          dimensionScores: {},
+          recommendations: [],
+          messages: [],
+          correlationWarning: null,
+        };
+
+        // Step 1: Regulatory compliance gate
+        const regResult = computeRegulatoryScore(inputs.regulatory);
+        if (regResult.block) {
+          result.regulatoryBlock = true;
+          result.messages.push(
+            "Regulatory Block \u2014 This configuration violates BPRD Circular 1/2025. Voice cannot serve as standalone primary enrollment verification.",
+          );
+        }
+
+        // Step 2: 2G enrollment override
+        if (inputs.bandwidth === "2G_ENROLLMENT") {
+          result.enrollmentOverride = true;
+          result.composite = 20;
+          result.category = "NOT_FEASIBLE";
+          result.messages.push(
+            "Not Feasible \u2014 Enrollment over 2G is not viable in field conditions. Use partner-embedded enrollment or upgrade connectivity.",
+          );
+        }
+
+        if (result.regulatoryBlock || result.enrollmentOverride) return result;
+
+        // Step 3: Dimension scores
+        const bwScore = BANDWIDTH_SCORES[inputs.bandwidth];
+        const deviceScore = DEVICE_SCORES[inputs.device];
+        const noiseScore = NOISE_SCORES[inputs.noise];
+        const dialectScore = DIALECT_SCORES[inputs.dialect];
+        const regScore = regResult.score;
+        result.dimensionScores = {
+          bandwidth: bwScore,
+          device: deviceScore,
+          noise: noiseScore,
+          regulatory: regScore,
+          dialect: dialectScore,
+        };
+
+        // Step 4: Weighted composite
+        const composite =
+          bwScore * WEIGHTS.bandwidth +
+          deviceScore * WEIGHTS.device +
+          noiseScore * WEIGHTS.noise +
+          regScore * WEIGHTS.regulatory +
+          dialectScore * WEIGHTS.dialect;
+        result.composite = Math.round(composite * 100) / 100;
+
+        // Step 5: Category
+        if (result.composite >= 70) result.category = "PROCEED";
+        else if (result.composite >= 40)
+          result.category = "PROCEED_WITH_MODIFICATIONS";
+        else result.category = "NOT_FEASIBLE";
+
+        // Step 6: Correlation detection
+        const lowDims = [];
+        if (bwScore < 50) lowDims.push("bandwidth");
+        if (deviceScore < 50) lowDims.push("device");
+        if (noiseScore < 60) lowDims.push("noise");
+        if (dialectScore < 60) lowDims.push("dialect");
+
+        if (lowDims.length >= 3) {
+          result.correlationWarning = {
+            severity: "high",
+            count: lowDims.length,
+            dimensions: lowDims,
+            message:
+              "High correlation risk \u2014 " +
+              lowDims.length +
+              " dimensions are simultaneously degraded (" +
+              lowDims.join(", ") +
+              "). In real deployment conditions, these constraints co-occur and compound multiplicatively. The composite score likely overestimates feasibility. Conduct field testing before deployment.",
+            profile: detectCorrelationProfile(inputs),
+          };
+        } else if (lowDims.length === 2) {
+          result.correlationWarning = {
+            severity: "moderate",
+            count: lowDims.length,
+            dimensions: lowDims,
+            message:
+              "Moderate correlation risk \u2014 " +
+              lowDims.length +
+              " dimensions are simultaneously degraded (" +
+              lowDims.join(", ") +
+              "). These constraints often co-occur in field conditions. The composite score may overestimate feasibility for this deployment profile.",
+            profile: detectCorrelationProfile(inputs),
+          };
+        }
+
+        // Step 7: Recommendations
+        if (bwScore < RECOMMENDATIONS.bandwidth.threshold)
+          result.recommendations.push({
+            dimension: "Bandwidth",
+            ...RECOMMENDATIONS.bandwidth,
+          });
+        if (deviceScore < RECOMMENDATIONS.device.threshold)
+          result.recommendations.push({
+            dimension: "Device",
+            ...RECOMMENDATIONS.device,
+          });
+        if (noiseScore < RECOMMENDATIONS.noise.threshold)
+          result.recommendations.push({
+            dimension: "Noise",
+            ...RECOMMENDATIONS.noise,
+          });
+        if (regScore < RECOMMENDATIONS.regulatory_auth.threshold) {
+          result.recommendations.push(
+            inputs.regulatory.authOnly
+              ? { dimension: "Regulatory", ...RECOMMENDATIONS.regulatory_auth }
+              : {
+                  dimension: "Regulatory",
+                  ...RECOMMENDATIONS.regulatory_enrollment,
+                },
+          );
+        }
+        if (dialectScore < RECOMMENDATIONS.dialect.threshold)
+          result.recommendations.push({
+            dimension: "Dialect",
+            ...RECOMMENDATIONS.dialect,
+          });
+
+        return result;
+      }
+
+      // ═══════════════════════════════════════════════════
+      // UI COMPONENTS
+      // ═══════════════════════════════════════════════════
+
+      function Select({ label, value, onChange, options, helpText }) {
+        return (
+          <div className="mb-5">
+            <label className="block text-sm font-semibold text-gray-700 mb-1.5">
+              {label}
+            </label>
+            {helpText && (
+              <p className="text-xs text-gray-500 mb-1.5">{helpText}</p>
+            )}
+            <select
+              value={value}
+              onChange={(e) => onChange(e.target.value)}
+              className="w-full px-3 py-2.5 bg-white border border-gray-300 rounded-lg text-sm text-gray-800 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none pr-8 cursor-pointer hover:border-gray-400 transition-colors"
+            >
+              {options.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        );
+      }
+
+      function Checkbox({ label, checked, onChange, helpText }) {
+        return (
+          <label className="flex items-start gap-2.5 py-1.5 cursor-pointer group">
+            <input
+              type="checkbox"
+              checked={checked}
+              onChange={(e) => onChange(e.target.checked)}
+              className="mt-0.5 w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+            />
+            <div>
+              <span className="text-sm text-gray-700 group-hover:text-gray-900 transition-colors">
+                {label}
+              </span>
+              {helpText && (
+                <p className="text-xs text-gray-500 mt-0.5">{helpText}</p>
+              )}
+            </div>
+          </label>
+        );
+      }
+
+      function InputPanel({ inputs, setInputs }) {
+        const set = (key, val) =>
+          setInputs((prev) => ({ ...prev, [key]: val }));
+        const setReg = (key, val) =>
+          setInputs((prev) => ({
+            ...prev,
+            regulatory: { ...prev.regulatory, [key]: val },
+          }));
+
+        return (
+          <div className="space-y-1">
+            <h2 className="text-lg font-bold text-gray-900 mb-4">
+              Deployment Parameters
+            </h2>
+
+            <Select
+              label="Network Bandwidth"
+              value={inputs.bandwidth}
+              onChange={(v) => set("bandwidth", v)}
+              helpText="Select the primary connectivity available at the deployment site"
+              options={[
+                {
+                  value: "2G_ENROLLMENT",
+                  label: "2G \u2014 Enrollment Use Case",
+                },
+                { value: "2G_AUTH", label: "2G \u2014 Authentication Only" },
+                { value: "3G", label: "3G" },
+                { value: "4G", label: "4G / LTE" },
+                { value: "WIFI", label: "WiFi" },
+              ]}
+            />
+
+            <Select
+              label="Device Capability"
+              value={inputs.device}
+              onChange={(v) => set("device", v)}
+              helpText="Primary device class used for voice capture"
+              options={[
+                { value: "FEATURE_PHONE", label: "Feature Phone" },
+                { value: "LOW_END_SMARTPHONE", label: "Low-end Smartphone" },
+                {
+                  value: "MID_RANGE_SMARTPHONE",
+                  label: "Mid-range Smartphone",
+                },
+                { value: "MODERN_SMARTPHONE", label: "Modern Smartphone" },
+              ]}
+            />
+
+            <Select
+              label="Environmental Noise"
+              value={inputs.noise}
+              onChange={(v) => set("noise", v)}
+              helpText="Acoustic conditions during enrollment or authentication"
+              options={[
+                { value: "CALL_CENTER", label: "Call Center (Controlled)" },
+                { value: "INDOOR_HOME", label: "Indoor Home" },
+                { value: "RURAL_OUTDOOR", label: "Rural Outdoor" },
+                { value: "URBAN_OUTDOOR", label: "Urban Outdoor" },
+              ]}
+            />
+
+            <Select
+              label="Language / Dialect"
+              value={inputs.dialect}
+              onChange={(v) => set("dialect", v)}
+              helpText="Speaker dialect relative to model training data (assumes Urdu-trained model)"
+              options={[
+                { value: "URDU_STANDARD", label: "Urdu (Standard)" },
+                { value: "PUNJABI", label: "Punjabi" },
+                { value: "SINDHI", label: "Sindhi" },
+                { value: "PASHTO", label: "Pashto" },
+                { value: "BALOCHI", label: "Balochi" },
+                { value: "OTHER", label: "Other / Regional Dialect" },
+              ]}
+            />
+
+            <div className="pt-1">
+              <label className="block text-sm font-semibold text-gray-700 mb-1.5">
+                Regulatory Alignment
+              </label>
+              <p className="text-xs text-gray-500 mb-2">
+                SBP BPRD Circular 1/2025 compliance factors
+              </p>
+              <div className="space-y-1.5 bg-gray-50 rounded-lg p-3 border border-gray-200">
+                <Checkbox
+                  label="NADRA CNIC biometric verified at account opening"
+                  checked={inputs.regulatory.nadraVerified}
+                  onChange={(v) => setReg("nadraVerified", v)}
+                />
+                <Checkbox
+                  label="Use case is authentication only (not enrollment)"
+                  checked={inputs.regulatory.authOnly}
+                  onChange={(v) => setReg("authOnly", v)}
+                />
+                <Checkbox
+                  label="SBP Tier 1 (simplified KYC) acceptable"
+                  checked={inputs.regulatory.tier1}
+                  onChange={(v) => setReg("tier1", v)}
+                  helpText="Asaan Account / Asaan Digital Account"
+                />
+                <div className="border-t border-gray-300 my-2"></div>
+                <Checkbox
+                  label="Standalone biometric enrollment \u2014 no NADRA layer"
+                  checked={inputs.regulatory.standaloneEnrollment}
+                  onChange={(v) => setReg("standaloneEnrollment", v)}
+                  helpText="Non-compliant under Circular 1/2025. Triggers regulatory block."
+                />
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      function ScoreRing({ score, category }) {
+        const radius = 70;
+        const circumference = 2 * Math.PI * radius;
+        const offset = circumference - (score / 100) * circumference;
+        const color =
+          category === "PROCEED"
+            ? "#059669"
+            : category === "PROCEED_WITH_MODIFICATIONS"
+              ? "#D97706"
+              : "#DC2626";
+
+        return (
+          <div className="flex flex-col items-center">
+            <svg width="180" height="180" className="transform -rotate-90">
+              <circle
+                cx="90"
+                cy="90"
+                r={radius}
+                stroke="#E5E7EB"
+                strokeWidth="12"
+                fill="none"
+              />
+              <circle
+                cx="90"
+                cy="90"
+                r={radius}
+                stroke={color}
+                strokeWidth="12"
+                fill="none"
+                strokeDasharray={circumference}
+                strokeDashoffset={offset}
+                strokeLinecap="round"
+                className="score-ring"
+              />
+            </svg>
+            <div className="absolute mt-12 text-center">
+              <div className="text-4xl font-bold" style={{ color }}>
+                {score}
+              </div>
+              <div className="text-xs text-gray-500 mt-1">/ 100</div>
+            </div>
+          </div>
+        );
+      }
+
+      function CategoryBadge({ category }) {
+        const configs = {
+          PROCEED: {
+            label: "Proceed",
+            bg: "bg-emerald-100",
+            text: "text-emerald-800",
+            border: "border-emerald-300",
+          },
+          PROCEED_WITH_MODIFICATIONS: {
+            label: "Proceed with Modifications",
+            bg: "bg-amber-100",
+            text: "text-amber-800",
+            border: "border-amber-300",
+          },
+          NOT_FEASIBLE: {
+            label: "Not Feasible",
+            bg: "bg-red-100",
+            text: "text-red-800",
+            border: "border-red-300",
+          },
+        };
+        const c = configs[category] || configs.NOT_FEASIBLE;
+        return (
+          <span
+            className={`inline-block px-3 py-1 rounded-full text-sm font-semibold border ${c.bg} ${c.text} ${c.border}`}
+          >
+            {c.label}
+          </span>
+        );
+      }
+
+      function DimensionBar({ label, score, weight, maxScore = 100 }) {
+        const pct = (score / maxScore) * 100;
+        const color =
+          score >= 70
+            ? "bg-emerald-500"
+            : score >= 40
+              ? "bg-amber-500"
+              : "bg-red-500";
+        return (
+          <div className="mb-3">
+            <div className="flex justify-between text-sm mb-1">
+              <span className="text-gray-700">
+                {label}{" "}
+                <span className="text-gray-400 text-xs">
+                  ({(weight * 100).toFixed(0)}%)
+                </span>
+              </span>
+              <span className="font-semibold text-gray-800">{score}</span>
+            </div>
+            <div className="w-full bg-gray-200 rounded-full h-2">
+              <div
+                className={`h-2 rounded-full transition-all duration-500 ${color}`}
+                style={{ width: `${pct}%` }}
+              ></div>
+            </div>
+          </div>
+        );
+      }
+
+      function OverrideBanner({ messages }) {
+        return (
+          <div className="space-y-3 fade-in">
+            {messages.map((msg, i) => (
+              <div
+                key={i}
+                className="bg-red-50 border-l-4 border-red-500 p-4 rounded-r-lg"
+              >
+                <div className="flex items-start gap-2">
+                  <svg
+                    className="w-5 h-5 text-red-500 mt-0.5 flex-shrink-0"
+                    fill="currentColor"
+                    viewBox="0 0 20 20"
+                  >
+                    <path
+                      fillRule="evenodd"
+                      d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z"
+                      clipRule="evenodd"
+                    />
+                  </svg>
+                  <p className="text-sm text-red-800 font-medium">{msg}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        );
+      }
+
+      function RecommendationCard({ rec }) {
+        return (
+          <div className="bg-amber-50 border border-amber-200 rounded-lg p-3.5 fade-in">
+            <div className="text-xs font-bold text-amber-700 uppercase tracking-wide mb-1">
+              {rec.dimension}
+            </div>
+            <p className="text-sm text-gray-800 leading-relaxed">{rec.text}</p>
+          </div>
+        );
+      }
+
+      function CorrelationWarning({ warning }) {
+        if (!warning) return null;
+        const isHigh = warning.severity === "high";
+        return (
+          <div
+            className={`${isHigh ? "bg-orange-50 border-orange-400" : "bg-yellow-50 border-yellow-400"} border-l-4 p-4 rounded-r-lg fade-in`}
+          >
+            <div className="flex items-start gap-2">
+              <svg
+                className={`w-5 h-5 ${isHigh ? "text-orange-500" : "text-yellow-500"} mt-0.5 flex-shrink-0`}
+                fill="currentColor"
+                viewBox="0 0 20 20"
+              >
+                <path
+                  fillRule="evenodd"
+                  d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z"
+                  clipRule="evenodd"
+                />
+              </svg>
+              <div>
+                <p
+                  className={`text-sm ${isHigh ? "text-orange-800" : "text-yellow-800"} font-medium`}
+                >
+                  {warning.message}
+                </p>
+                {warning.profile && (
+                  <div className="mt-2 text-xs text-gray-600">
+                    <span className="font-semibold">
+                      Deployment profile match:
+                    </span>{" "}
+                    {warning.profile.label} ({warning.profile.matchStrength}{" "}
+                    dimensions)
+                    <p className="mt-1 text-gray-500">
+                      {warning.profile.description}
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      function ResultsPanel({ result }) {
+        const hasOverride = result.regulatoryBlock || result.enrollmentOverride;
+
+        return (
+          <div className="space-y-5">
+            <h2 className="text-lg font-bold text-gray-900">
+              Feasibility Assessment
+            </h2>
+
+            {hasOverride && <OverrideBanner messages={result.messages} />}
+
+            {!hasOverride && result.composite !== null && (
+              <div className="fade-in">
+                <div className="flex flex-col items-center mb-5 relative">
+                  <ScoreRing
+                    score={result.composite}
+                    category={result.category}
+                  />
+                  <div className="mt-3">
+                    <CategoryBadge category={result.category} />
+                  </div>
+                </div>
+                <p className="text-xs text-center text-gray-500 italic mb-5">
+                  This score reflects structured feasibility analysis, not
+                  empirical field data.
+                </p>
+
+                <div className="bg-white rounded-lg border border-gray-200 p-4 mb-5">
+                  <h3 className="text-sm font-bold text-gray-700 mb-3">
+                    Dimension Breakdown
+                  </h3>
+                  <DimensionBar
+                    label="Bandwidth"
+                    score={result.dimensionScores.bandwidth}
+                    weight={WEIGHTS.bandwidth}
+                  />
+                  <DimensionBar
+                    label="Device"
+                    score={result.dimensionScores.device}
+                    weight={WEIGHTS.device}
+                  />
+                  <DimensionBar
+                    label="Noise"
+                    score={result.dimensionScores.noise}
+                    weight={WEIGHTS.noise}
+                  />
+                  <DimensionBar
+                    label="Regulatory"
+                    score={result.dimensionScores.regulatory}
+                    weight={WEIGHTS.regulatory}
+                  />
+                  <DimensionBar
+                    label="Dialect"
+                    score={result.dimensionScores.dialect}
+                    weight={WEIGHTS.dialect}
+                  />
+                </div>
+
+                {result.correlationWarning && (
+                  <div className="mb-4">
+                    <CorrelationWarning warning={result.correlationWarning} />
+                  </div>
+                )}
+
+                {result.recommendations.length > 0 && (
+                  <div>
+                    <h3 className="text-sm font-bold text-gray-700 mb-3">
+                      Recommendations
+                    </h3>
+                    <div className="space-y-2.5">
+                      {result.recommendations.map((r, i) => (
+                        <RecommendationCard key={i} rec={r} />
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {result.recommendations.length === 0 &&
+                  result.category === "PROCEED" && (
+                    <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-4 text-sm text-emerald-800">
+                      Voice biometric deployment is feasible under these
+                      conditions. Recommend wideband enrollment with server-side
+                      feature extraction where device supports it.
+                    </div>
+                  )}
+              </div>
+            )}
+          </div>
+        );
+      }
+
+      function MethodologyDrawer() {
+        const [open, setOpen] = useState(false);
+        return (
+          <div className="border-t border-gray-200 mt-8 pt-4">
+            <button
+              onClick={() => setOpen(!open)}
+              className="flex items-center gap-2 text-sm font-semibold text-blue-700 hover:text-blue-900 transition-colors w-full text-left"
+            >
+              <svg
+                className={`w-4 h-4 transition-transform ${open ? "rotate-90" : ""}`}
+                fill="currentColor"
+                viewBox="0 0 20 20"
+              >
+                <path
+                  fillRule="evenodd"
+                  d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z"
+                  clipRule="evenodd"
+                />
+              </svg>
+              Methodology and Scoring Logic
+            </button>
+            <div className={`drawer-content ${open ? "open" : ""}`}>
+              <div className="mt-4 space-y-4 text-sm text-gray-700 leading-relaxed">
+                <div>
+                  <h4 className="font-bold text-gray-900 mb-1">
+                    Five Assessment Dimensions
+                  </h4>
+                  <p>
+                    The feasibility score is a weighted composite of five
+                    dimensions: Bandwidth Sufficiency (25%), Device Capability
+                    (15%), Environmental Noise (20%), Regulatory Alignment
+                    (20%), and Language/Dialect Match (20%). Each dimension is
+                    scored 0 to 100 based on structured engineering criteria,
+                    then combined using the weighted formula.
+                  </p>
+                </div>
+
+                <div>
+                  <h4 className="font-bold text-gray-900 mb-1">
+                    Override Conditions
+                  </h4>
+                  <p>
+                    Two conditions override the composite calculation entirely.
+                    First, if standalone biometric enrollment is selected
+                    without a NADRA verification layer, the system returns a
+                    Regulatory Block per BPRD Circular 1/2025. Second, if 2G
+                    connectivity is paired with an enrollment use case, the
+                    composite is hard-capped at 20 because G.729 at 8 kbps
+                    cannot sustain enrollment audio transmission on real-world
+                    2G throughput of 10 to 15 kbps. These overrides evaluate
+                    before the weighted formula runs.
+                  </p>
+                </div>
+
+                <div>
+                  <h4 className="font-bold text-gray-900 mb-1">
+                    Dialect Dimension Caveat
+                  </h4>
+                  <p>
+                    Dialect scores assume a standard Urdu/Hindustani-trained
+                    speaker verification model. Scores reflect phonological
+                    divergence between the speaker's dialect and the model's
+                    training data. They are structured risk indicators, not
+                    measured FAR/FRR accuracy predictions. Institutions using
+                    dialect-adapted or Meta MMS-based multilingual models should
+                    override this dimension. Pakistan has six major language
+                    groups, and acoustic mismatch is the most underappreciated
+                    failure mode in local voice biometric deployments.
+                  </p>
+                </div>
+
+                <div>
+                  <h4 className="font-bold text-gray-900 mb-1">
+                    BPRD Circular 1/2025
+                  </h4>
+                  <p>
+                    The SBP's BPRD Circular No. 1 of 2025, effective October 25,
+                    2025, mandated biometric verification as the primary
+                    onboarding method for all SBP-regulated entities: banks,
+                    DFIs, MFBs, digital banks, and EMIs. This changed the
+                    regulatory dimension from a symmetric scoring axis to a
+                    gated system. Voice can only serve as a secondary
+                    authentication factor; standalone voice enrollment is
+                    non-compliant. Practitioners in other markets should
+                    substitute their equivalent regulatory instrument (CBN for
+                    Nigeria, Bangladesh Bank, Bank Negara for Malaysia).
+                  </p>
+                </div>
+
+                <div>
+                  <h4 className="font-bold text-gray-900 mb-1">
+                    Multi-Market Applicability
+                  </h4>
+                  <p>
+                    The framework is parameterizable. The regulatory input can
+                    be swapped for CBN (Nigeria), Bangladesh Bank, or Bank
+                    Negara (Malaysia) requirements. The dialect dimension maps
+                    to Hausa/Yoruba/Igbo for Nigeria, Bengali dialects for
+                    Bangladesh, or Amharic/Oromo for Ethiopia. The tool's
+                    architecture supports market-specific dropdown values and
+                    regulatory checklist items without rebuilding the scoring
+                    engine.
+                  </p>
+                </div>
+
+                <div>
+                  <h4 className="font-bold text-gray-900 mb-1">
+                    Scoring Weights
+                  </h4>
+                  <p>
+                    Weights are grounded in engineering constraints, not
+                    empirically derived. Bandwidth at 25% is anchored to the
+                    G.729/8 kbps versus real-world 2G throughput constraint.
+                    Dialect at 20% reflects documented phonological divergence
+                    between Urdu-trained models and Pakistani regional
+                    languages. Noise at 20% reflects the irreversibility of
+                    enrollment-time template degradation. Device at 15% reflects
+                    the compensability of device limitations through server-side
+                    processing. All weights are transparent and disclosed; a
+                    future version could allow weight customization.
+                  </p>
+                </div>
+
+                <div>
+                  <h4 className="font-bold text-gray-900 mb-1">
+                    Correlated Dimensions in Real Markets
+                  </h4>
+                  <p>
+                    The weighted composite treats dimensions as independent, but
+                    in real emerging markets they are often correlated. Rural
+                    areas typically have 2G connectivity, minority dialect
+                    speakers, outdoor noise environments, and feature phones
+                    simultaneously. Urban centers have 4G, national language
+                    speakers, indoor environments, and modern smartphones. A
+                    rural Balochi speaker on 2G does not have "one weak
+                    dimension" — they have systematically degraded conditions
+                    that compound multiplicatively, not additively. The tool
+                    detects these correlation patterns and displays an explicit
+                    warning when three or more dimensions are simultaneously
+                    degraded, because a simple weighted average underestimates
+                    the compounding failure risk in those scenarios. Treat the
+                    correlation warning as a signal to conduct field testing
+                    before committing to deployment.
+                  </p>
+                </div>
+
+                <div>
+                  <h4 className="font-bold text-gray-900 mb-1">
+                    Purpose and Intended Use
+                  </h4>
+                  <p>
+                    This tool is designed for fintech builders working in voice
+                    authentication to test their pre-deployment strategy. It
+                    surfaces deployment risks across infrastructure, linguistic,
+                    and regulatory dimensions before production commitment. The
+                    output is a structured decision aid, not a deployment
+                    guarantee. Use it to identify which failure modes apply to
+                    your specific scenario, then validate with field testing in
+                    your target deployment conditions.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      function App() {
+        const [inputs, setInputs] = useState({
+          bandwidth: "3G",
+          device: "LOW_END_SMARTPHONE",
+          noise: "INDOOR_HOME",
+          dialect: "URDU_STANDARD",
+          regulatory: {
+            nadraVerified: true,
+            authOnly: true,
+            tier1: false,
+            standaloneEnrollment: false,
+          },
+        });
+
+        const result = useMemo(() => computeFeasibility(inputs), [inputs]);
+
+        return (
+          <div className="min-h-screen bg-gray-50">
+            {/* Header */}
+            <header className="bg-white border-b border-gray-200 sticky top-0 z-10">
+              <div className="max-w-6xl mx-auto px-4 py-4 sm:px-6">
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 bg-blue-600 rounded-lg flex items-center justify-center">
+                    <svg
+                      className="w-5 h-5 text-white"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      strokeWidth="2"
+                      stroke="currentColor"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M12 18.75a6 6 0 006-6v-1.5m-6 7.5a6 6 0 01-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 01-3-3V4.5a3 3 0 116 0v8.25a3 3 0 01-3 3z"
+                      />
+                    </svg>
+                  </div>
+                  <div>
+                    <h1 className="text-lg font-bold text-gray-900">
+                      Voice Biometric Feasibility Checker
+                    </h1>
+                    <p className="text-xs text-gray-500">
+                      Pre-deployment strategy testing for voice authentication
+                      in emerging markets
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </header>
+
+            {/* Main Content */}
+            <main className="max-w-6xl mx-auto px-4 py-6 sm:px-6">
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                {/* Left: Inputs */}
+                <div className="bg-white rounded-xl border border-gray-200 p-5 shadow-sm h-fit">
+                  <InputPanel inputs={inputs} setInputs={setInputs} />
+                </div>
+
+                {/* Right: Results */}
+                <div className="bg-white rounded-xl border border-gray-200 p-5 shadow-sm h-fit">
+                  <ResultsPanel result={result} />
+                </div>
+              </div>
+
+              {/* Methodology Drawer */}
+              <div className="bg-white rounded-xl border border-gray-200 p-5 shadow-sm mt-6">
+                <MethodologyDrawer />
+              </div>
+
+              {/* Footer */}
+              <footer className="text-center text-xs text-gray-400 mt-8 pb-6">
+                <p>Voice Biometric Feasibility Checker &middot; Fawad Liaqat</p>
+                <p className="mt-1">
+                  Pre-deployment strategy testing for voice authentication
+                  across bandwidth-constrained emerging markets
+                </p>
+                <p className="mt-1">
+                  Dimensions may be correlated in real deployments. Correlation
+                  warnings are advisory. Validate with field testing.
+                </p>
+              </footer>
+            </main>
+          </div>
+        );
+      }
+
+      ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+    </script>
+  </body>
+</html>
