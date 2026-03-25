@@ -50,6 +50,3 @@ See [METHODOLOGY.md](METHODOLOGY.md) for the full scoring rationale, limitations
 
 Single-page React application with Tailwind CSS. No backend, no API keys, no build tools required. The scoring engine is pure JavaScript with no external dependencies.
 
-## Author
-
-Fawad Liaqat — March 2026
